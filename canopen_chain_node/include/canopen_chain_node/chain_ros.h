@@ -10,32 +10,41 @@
 #include <diagnostic_updater/diagnostic_updater.h>
 #include <boost/filesystem/path.hpp>
 #include <boost/weak_ptr.hpp>
+#include <pluginlib/class_loader.h>
 
 namespace canopen{
 
 class MergedXmlRpcStruct : public XmlRpc::XmlRpcValue{
+    MergedXmlRpcStruct(const XmlRpc::XmlRpcValue& a) :XmlRpc::XmlRpcValue(a){ assertStruct(); }
 public:
-    MergedXmlRpcStruct(){
+    MergedXmlRpcStruct(){ assertStruct(); }
+    MergedXmlRpcStruct(const XmlRpc::XmlRpcValue& a, const MergedXmlRpcStruct &b, bool recursive= true) :XmlRpc::XmlRpcValue(a){
         assertStruct();
-    }
-    MergedXmlRpcStruct(XmlRpc::XmlRpcValue& a, MergedXmlRpcStruct &b) :XmlRpc::XmlRpcValue(a){
-        assertStruct();
-        _value.asStruct->insert(b._value.asStruct->begin(), b._value.asStruct->end());
+
+        for(ValueStruct::const_iterator it = b._value.asStruct->begin(); it != b._value.asStruct->end(); ++it){
+            std::pair<XmlRpc::XmlRpcValue::iterator,bool> res =  _value.asStruct->insert(*it);
+
+            if(recursive && !res.second && res.first->second.getType() == XmlRpc::XmlRpcValue::TypeStruct && it->second.getType() == XmlRpc::XmlRpcValue::TypeStruct){
+                res.first->second = MergedXmlRpcStruct(res.first->second, it->second); // recursive struct merge with implicit cast
+            }
+        }
+
+
     }
 };
 
-template<typename NodeType> class Logger{
-    boost::weak_ptr<NodeType> node_;
+class Logger: public DiagGroup<canopen::Layer>{
+    const boost::shared_ptr<canopen::Node> node_;
+    
     std::vector<boost::function< void (diagnostic_updater::DiagnosticStatusWrapper &)> > entries_;
     
     template<typename T> void log_entry(diagnostic_updater::DiagnosticStatusWrapper &stat, const std::string &name, const ObjectDict::Key &key){
-        boost::shared_ptr<NodeType> node = node_.lock();
-        if(node){
-            stat.add(name, node->template get<T>(key));
-        }
+        stat.add(name, node_->template get<T>(key));
     }
+
 public:
-    Logger(boost::shared_ptr<NodeType> node):  node_(node) {}
+    Logger(boost::shared_ptr<canopen::Node> node):  node_(node) { add(node_); }
+    
     template<typename T> void add(const std::string &name, const ObjectDict::Key &key){
             entries_.push_back(boost::bind(&Logger::log_entry<T>, this, _1, name, key));
     }
@@ -46,28 +55,35 @@ public:
         branch_type<Logger, void (Logger &, const std::string &, const ObjectDict::Key &)>(data_type)(*this,name, key);
     }
 
-    virtual void log(diagnostic_updater::DiagnosticStatusWrapper &stat){
-        boost::shared_ptr<NodeType> node = node_.lock();
-        if(node){
-            stat.summaryf(diagnostic_msgs::DiagnosticStatus::OK, "Active");
-            if(node->getState() == canopen::Node::Operational)
-                for(size_t i=0; i < entries_.size(); ++i) entries_[i](stat);
-            //ROS_INFO_STREAM(node->getStorage()->template entry<std::string>(0x1008).get_once());
-            //stat.add("desc",std::string());
+    template<typename T> void add(const boost::shared_ptr<T> &n){
+        DiagGroup::add(boost::static_pointer_cast<canopen::Layer>(n));
+    }
 
+    virtual void log(diagnostic_updater::DiagnosticStatusWrapper &stat){
+        LayerReport r;
+        diag(r);
+        if(r.bounded<LayerStatus::Unbounded>()){ // valid
+            stat.summary(r.get(), r.reason());
+            for(std::vector<std::pair<std::string, std::string> >::const_iterator it = r.values().begin(); it != r.values().end(); ++it){
+                stat.add(it->first, it->second);
+            }
         }
+        // for(size_t i=0; i < entries_.size(); ++i) entries_[i](stat); TODO
     }
     virtual ~Logger() {}
 };
 
-template<typename InterfaceType, typename MasterType> class RosChain : public canopen::LayerStack {
+class RosChain : public canopen::LayerStack {
+      pluginlib::ClassLoader<can::DriverInterface> driver_loader_;
 protected:
     std::string chain_name_;
     
-    boost::shared_ptr<InterfaceType> interface_;
-    boost::shared_ptr<MasterType> master_;
-    boost::shared_ptr<canopen::LayerGroup<canopen::Node> > nodes_;
+    boost::shared_ptr<can::DriverInterface> interface_;
+    boost::shared_ptr<Master> master_;
+    boost::shared_ptr<canopen::LayerGroupNoDiag<canopen::Node> > nodes_;
     boost::shared_ptr<canopen::SyncLayer> sync_;
+    std::vector<boost::shared_ptr<Logger > > loggers_;
+
 
     can::StateInterface::StateListener::Ptr state_listener_;
     
@@ -90,7 +106,7 @@ protected:
     boost::weak_ptr<LayerStatus> pending_status_;
     
     void logState(const can::State &s){
-        boost::shared_ptr<InterfaceType> interface = interface_;
+        boost::shared_ptr<can::DriverInterface> interface = interface_;
         std::string msg;
         if(interface && !interface->translateError(s.internal_error, msg)) msg  =  "Undefined"; ;
         ROS_INFO_STREAM("Current state: " << s.driver_state << " device error: " << s.error_code << " internal_error: " << s.internal_error << " (" << msg << ")");
@@ -153,6 +169,9 @@ protected:
             boost::shared_ptr<LayerStatus> pending_status(new LayerStatus);
             pending_status_ = pending_status;
             try{
+                thread_->interrupt();
+                thread_->join();
+                thread_.reset(new boost::thread(&RosChain::run, this));
                 recover(*pending_status);
                 res.success.data = pending_status->bounded<LayerStatus::Warn>();
                 res.error_message.data = pending_status->reason();
@@ -210,25 +229,53 @@ protected:
     bool setup_bus(){
         ros::NodeHandle bus_nh(nh_priv_,"bus");
         std::string can_device;
-        int can_bitrate = 0;
+        std::string driver_plugin;
+        std::string master_type;
+        bool loopback;
         
         if(!bus_nh.getParam("device",can_device)){
             ROS_ERROR("Device not set");
             return false;
         }
         
-        bus_nh.param("bitrate",can_bitrate, 0);
+        bus_nh.param("loopback",loopback, true);
         
-        if(can_bitrate < 0){
-            ROS_ERROR_STREAM("CAN bitrate  "<< can_bitrate << " is invalid");
+        bus_nh.param("driver_plugin",driver_plugin, std::string("can::SocketCANInterface"));
+
+        try{
+            interface_ =  driver_loader_.createInstance(driver_plugin);
+        }
+            
+        catch(pluginlib::PluginlibException& ex){
+            ROS_ERROR_STREAM(ex.what());
             return false;
         }
-        interface_ = boost::make_shared<InterfaceType>(true); // enable loopback
-        state_listener_ = interface_->createStateListener(can::StateInterface::StateDelegate(this, &RosChain::logState));
         
-        master_ = boost::make_shared<MasterType>(can_device, interface_);
+	state_listener_ = interface_->createStateListener(can::StateInterface::StateDelegate(this, &RosChain::logState));
         
-        add(boost::make_shared<CANLayer<InterfaceType> >(interface_, can_device, can_bitrate));
+        bus_nh.param("master_type",master_type, std::string("shared"));
+
+        try{
+            if(master_type == "exclusive"){
+                master_ = boost::make_shared<SharedMaster>(can_device, interface_);
+            }else if (master_type == "shared"){
+                boost::interprocess::permissions perm;
+                perm.set_unrestricted();
+                master_ = boost::make_shared<SharedMaster>(can_device, interface_, perm);
+            }else if (master_type == "local"){
+                master_ = boost::make_shared<LocalMaster>(can_device, interface_);
+            }else{
+                ROS_ERROR_STREAM("Master type  "<< master_type << " is not supported");
+                return false;
+            }
+        }
+        catch( const std::exception &e){
+            std::string info = boost::diagnostic_information(e);
+            ROS_ERROR_STREAM(info);
+            return false;
+        }
+        
+        add(boost::make_shared<CANLayer>(interface_, can_device, loopback));
         
         return true;
     }
@@ -277,7 +324,7 @@ protected:
         return true;
     }
     bool setup_nodes(){
-        nodes_.reset(new canopen::LayerGroup<canopen::Node>("301 layer"));
+        nodes_.reset(new canopen::LayerGroupNoDiag<canopen::Node>("301 layer"));
         add(nodes_);
 
         XmlRpc::XmlRpcValue modules;
@@ -298,7 +345,16 @@ protected:
             }
 
             MergedXmlRpcStruct merged(module, defaults);
-                            
+
+            ObjectDict::Overlay overlay;
+            if(merged.hasMember("dcf_overlay")){
+                XmlRpc::XmlRpcValue dcf_overlay = merged["dcf_overlay"];
+                for(XmlRpc::XmlRpcValue::iterator it = dcf_overlay.begin(); it!= dcf_overlay.end(); ++it){
+                    overlay.push_back(ObjectDict::Overlay::value_type(it->first, it->second));
+                }
+
+            }
+
             std::string eds;
             
             try{
@@ -321,26 +377,27 @@ protected:
             catch(...){
             }
             
-            boost::shared_ptr<ObjectDict>  dict = ObjectDict::fromFile(eds);
+            boost::shared_ptr<ObjectDict>  dict = ObjectDict::fromFile(eds, overlay);
             if(!dict){
                 ROS_ERROR_STREAM("EDS '" << eds << "' could not be parsed");
                 return false;
             }
             boost::shared_ptr<canopen::Node> node = boost::make_shared<canopen::Node>(interface_, dict, node_id, sync_);
-            
-            if(!nodeAdded(merged, node)) return false;
 
-            boost::shared_ptr<Logger<canopen::Node> > logger = boost::make_shared<Logger<canopen::Node> >(node);
+            boost::shared_ptr<Logger> logger = boost::make_shared<Logger>(node);
+
+            if(!nodeAdded(merged, node, logger)) return false;
+
             //logger->add(4,"pos", canopen::ObjectDict::Key(0x6064));
-            diag_updater_.add(name, boost::bind(&Logger<Node>::log, logger, _1));
+            loggers_.push_back(logger);
+            diag_updater_.add(name, boost::bind(&Logger::log, logger, _1));
             
             nodes_->add(node);
         }
         return true;
     }
-    virtual bool nodeAdded(XmlRpc::XmlRpcValue &module, const boost::shared_ptr<canopen::Node> &node) { return true; }
+    virtual bool nodeAdded(XmlRpc::XmlRpcValue &module, const boost::shared_ptr<canopen::Node> &node, const boost::shared_ptr<Logger> &logger) { return true; }
     void report_diagnostics(diagnostic_updater::DiagnosticStatusWrapper &stat){
-        boost::mutex::scoped_lock lock(mutex_);
         LayerReport r;
         diag(r);
         if(r.bounded<LayerStatus::Unbounded>()){ // valid
@@ -351,7 +408,7 @@ protected:
         }
     }
 public:
-    RosChain(const ros::NodeHandle &nh, const ros::NodeHandle &nh_priv): LayerStack("ROS stack"),nh_(nh), nh_priv_(nh_priv), diag_updater_(nh_,nh_priv_){}
+    RosChain(const ros::NodeHandle &nh, const ros::NodeHandle &nh_priv): LayerStack("ROS stack"),driver_loader_("socketcan_interface", "can::DriverInterface"),nh_(nh), nh_priv_(nh_priv), diag_updater_(nh_,nh_priv_){}
     virtual bool setup(){
         boost::mutex::scoped_lock lock(mutex_);
 

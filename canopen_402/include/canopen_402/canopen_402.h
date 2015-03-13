@@ -65,7 +65,7 @@ namespace canopen
 class Node_402 : public canopen::Layer
 {
 public:
-  Node_402(boost::shared_ptr <canopen::Node> n, const std::string &name) : Layer(name), n_(n)
+  Node_402(boost::shared_ptr <canopen::Node> n, const std::string &name) : Layer(name), state_(Start), operation_mode_(No_Mode), operation_mode_to_set_(No_Mode), n_(n), check_mode(false)
   {
     configureEntries();
     status_word_mask.set(SW_Ready_To_Switch_On);
@@ -292,10 +292,12 @@ private:
   bool configuring_node_;
 
   bool recover_active_;
-  
+
+  bool enter_mode_failure_;
+
   /*template<typename Duration> bool waitMotorReady(const Duration &d){
     time_point t0 = boost::chrono::high_resolution_clock::now() + d;
-  
+
     boost::mutex::scoped_lock cond_lock(cond_mutex);
     motor_ready_ = false;
     while (!motor_ready_)
@@ -307,7 +309,7 @@ private:
     }
     return motor_ready_;
   }*/
-  
+
 };
 }  //  namespace canopen
 #endif  // CANOPEN_402_CANOPEN_402_H

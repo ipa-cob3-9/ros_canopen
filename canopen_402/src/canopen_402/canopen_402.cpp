@@ -212,7 +212,7 @@ void Node_402::pending(LayerStatus &status)
         ac_pos_ = actual_pos.get();
         ac_vel_ = 0;
 
-        target_pos_ = ac_pos_;
+        oldpos_ = target_pos_ = ac_pos_;
         target_vel_ = ac_vel_;
         configure_drive_ = false;
       }
@@ -286,7 +286,7 @@ void Node_402::switchMode(LayerStatus &status)
         cond.notify_all();
     }
     else
-    { 
+    {
         motorEnableOp();
     }
   }
@@ -301,7 +301,7 @@ bool Node_402::enterMode(const OperationMode &op_mode_var)
   control_word_bitset.set(CW_Halt);
   operation_mode_to_set_ = op_mode_var;
   check_mode = true;
-  
+
   target_pos_ = ac_pos_;
   target_vel_ = 0;
 
@@ -311,26 +311,28 @@ bool Node_402::enterMode(const OperationMode &op_mode_var)
 bool Node_402::enterModeAndWait(const OperationMode &op_mode_var)
 {
     boost::mutex::scoped_lock cond_lock(cond_mutex);
-    
+
     if(!isModeSupported(op_mode_var)){
       LOG( "Mode " << (int)op_mode_var << " not supported");
       return false;
     }
-    
+
     motor_ready_ = false;
-    
+    enter_mode_failure_ = false;
+
     LOG( "Enter mode" << (int)op_mode_var);
     enterMode(op_mode_var);
     time_point t0 = get_abs_time(boost::chrono::seconds(10));
-  
+
     while (!motor_ready_)
     {
       if (cond.wait_until(cond_lock, t0) == boost::cv_status::timeout)
       {
-          LOG("Mode Timeout");
+          enter_mode_failure_ = true;
           break;
       }
     }
+
     return motor_ready_;
 }
 
@@ -341,6 +343,7 @@ void Node_402::read(LayerStatus &status)
   operation_mode_ = (OperationMode) op_mode_display.get();
   ac_vel_ = actual_vel.get();
   ac_pos_ = actual_pos.get();
+  ac_eff_=0; //Currently no effort directly obtained from the HW
 }
 
 void Node_402::shutdown(LayerStatus &status)
@@ -353,7 +356,7 @@ void Node_402::diag(LayerReport &report)
 
 void Node_402::halt(LayerStatus &status)
 {
-  //control_word_bitset.set(CW_Halt);
+  control_word_bitset.set(CW_Halt);
 }
 
 
@@ -590,7 +593,8 @@ void Node_402::write(LayerStatus &status)
   {
     switchMode(status);
   }
-
+  else if(enter_mode_failure_)
+    status.error("Failed to enter mode");
   else if (state_ == Operation_Enable)
   {
     driveSettings();
@@ -609,6 +613,7 @@ const Node_402::State& Node_402::getState()
 
 const Node_402::OperationMode Node_402::getMode()
 {
+  if(operation_mode_ == Homing) return No_Mode; // TODO: remove after mode switch is handled properly in init
   return operation_mode_;
 }
 
@@ -629,7 +634,7 @@ uint32_t Node_402::getModeMask(const OperationMode &op_mode)
         case Cyclic_Synchronous_Torque:
         case Homing:
             return (1<<(op_mode-1));
-        case No_Mode:       
+        case No_Mode:
             return 0;
     }
     return 0;
@@ -684,8 +689,6 @@ void Node_402::configureEntries()
   n_->getStorage()->entry(op_mode_display, 0x6061);
   n_->getStorage()->entry(supported_drive_modes, 0x6502);
 
-  n_->getStorage()->entry(ip_mode_sub_mode, 0x60C0);
-
   n_->getStorage()->entry(actual_vel, 0x606C);
 
   n_->getStorage()->entry(actual_pos, 0x6064);
@@ -704,6 +707,7 @@ void Node_402::configureModeSpecificEntries()
   }
   if (isModeSupported(Interpolated_Position))
   {
+    n_->getStorage()->entry(ip_mode_sub_mode, 0x60C0);
     n_->getStorage()->entry(target_interpolated_position, 0x60C1, 0x01);
     if (ip_mode_sub_mode.get_cached() == -1)
       n_->getStorage()->entry(target_interpolated_velocity, 0x60C1, 0x02);

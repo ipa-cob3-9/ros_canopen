@@ -245,8 +245,7 @@ public:
         }
         sync_master_->notify(status);
     }
-    
-    virtual void diag(LayerReport &report) {}
+
     virtual void init(LayerStatus &status);
     virtual void shutdown(LayerStatus &status) {
         boost::mutex::scoped_lock lock(mutex_);
@@ -259,8 +258,10 @@ public:
         sync_master_->stop(status);
     }
     
-    virtual void halt(LayerStatus &status) {}
-    virtual void recover(LayerStatus &status) {}
+    virtual void pending(LayerStatus &status)  { /* nothing to do */ }
+    virtual void halt(LayerStatus &status)  { /* nothing to do */ }
+    virtual void diag(LayerReport &report)  { /* TODO */ }
+    virtual void recover(LayerStatus &status)  { /* TODO */ }
     
     virtual void addNode(void * const ptr) {
         boost::mutex::scoped_lock lock(mutex_);
@@ -296,7 +297,7 @@ class LocalMaster: public Master{
     boost::shared_ptr<can::CommInterface> interface_;
 public:
     virtual boost::shared_ptr<SyncLayer> getSync(const SyncProperties &properties);
-    LocalMaster(const std::string &name, boost::shared_ptr<can::CommInterface> interface) : interface_(interface)  {}
+    LocalMaster(const std::string &name, boost::shared_ptr<can::CommInterface> interface, const boost::interprocess::permissions & perm = boost::interprocess::permissions()) : interface_(interface)  {}
 };
 
 class SharedIPCSyncMaster : public IPCSyncMaster{
@@ -322,9 +323,9 @@ class SharedMaster: public Master{
     boost::unordered_map<can::Header, boost::shared_ptr<SharedIPCSyncMaster> > syncmasters_;
     boost::shared_ptr<can::CommInterface> interface_;
 public:
-    SharedMaster(const std::string &name, boost::shared_ptr<can::CommInterface> interface)
+    SharedMaster(const std::string &name, boost::shared_ptr<can::CommInterface> interface, const boost::interprocess::permissions & perm = boost::interprocess::permissions())
     : name_("canopen_master_shm_"+name), remover_(name_.c_str()),
-        managed_shm_(boost::interprocess::open_or_create, name_.c_str(), 4096),
+        managed_shm_(boost::interprocess::open_or_create, name_.c_str(), 4096, 0, perm),
         interface_(interface)  {}
     virtual boost::shared_ptr<SyncLayer> getSync(const SyncProperties &properties);
 };

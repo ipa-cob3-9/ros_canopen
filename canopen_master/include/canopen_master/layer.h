@@ -13,14 +13,12 @@ class LayerStatus{
         OK = 0, WARN = 1, ERROR= 2, STALE = 3, UNBOUNDED = 3
     };
     boost::atomic<State> state;
-    void set(const State &s){
+    std::string reason_;
+
+    virtual void set(const State &s, const std::string &r){
         boost::mutex::scoped_lock lock(write_mutex_);
         if(s > state) state = s;
-    }
-    std::string reason_;
-    void reason(const std::string &r){
         if(!r.empty()){
-            boost::mutex::scoped_lock lock(write_mutex_);
             if(reason_.empty())  reason_ = r;
             else reason_ += "; " + r;
         }
@@ -40,9 +38,9 @@ public:
     
     const std::string reason() const { boost::mutex::scoped_lock lock(write_mutex_); return reason_; }
 
-    const void warn(const std::string & r = "") { reason(r); set(WARN); }
-    const void error(const std::string & r = "") { reason(r); set(ERROR); }
-    const void stale(const std::string & r = "") { reason(r); set(STALE); }
+    const void warn(const std::string & r = "") { set(WARN, r); }
+    const void error(const std::string & r = "") { set(ERROR, r); }
+    const void stale(const std::string & r = "") { set(STALE, r); }
 };
 class LayerReport : public LayerStatus {
     std::vector<std::pair<std::string, std::string> > values_;
@@ -57,7 +55,8 @@ public:
 class Layer{
 public:
     const std::string name;
-    virtual void pending(LayerStatus &status) {}
+
+    virtual void pending(LayerStatus &status) = 0;
     virtual void read(LayerStatus &status) = 0;
     virtual void write(LayerStatus &status) = 0;
     
@@ -66,36 +65,12 @@ public:
     virtual void init(LayerStatus &status) = 0;
     virtual void shutdown(LayerStatus &status) = 0;
     
-    virtual void halt(LayerStatus &status) {} // TODO
+    virtual void halt(LayerStatus &status) = 0;
     virtual void recover(LayerStatus &status) = 0;
     
     Layer(const std::string &n) : name(n) {}
     
     virtual ~Layer() {}
-};
-
-class SimpleLayer: public Layer {
-    void adapt(bool (SimpleLayer::*func) (void), LayerStatus &status){
-        if(!(this->*func)()) status.error();
-    }
-public:
-        
-    virtual void read(LayerStatus &status) { adapt(&SimpleLayer::read, status); }
-    virtual void write(LayerStatus &status) { adapt(&SimpleLayer::write, status); }
-    virtual void diag(LayerReport &report) { adapt(&SimpleLayer::report, report); }
-    virtual void init(LayerStatus &status) { adapt(&SimpleLayer::init, status); }
-    virtual void recover(LayerStatus &status) { adapt(&SimpleLayer::recover, status); }
-    virtual void shutdown(LayerStatus &status) {  adapt(&SimpleLayer::shutdown, status); }
-    
-    virtual bool read()  = 0;
-    virtual bool write()  = 0;
-    virtual bool report()  = 0;
-    virtual bool init()  = 0;
-    virtual bool recover()  = 0;
-    virtual bool shutdown()  = 0;
-    
-    SimpleLayer(const std::string &n) : Layer(n) {}
-    SimpleLayer() : Layer("NO NAME GIVEN") {}
 };
 
 template<typename T> class VectorHelper{
@@ -104,9 +79,11 @@ protected:
     vector_type layers;
     
     template<typename Bound, typename Iterator, typename Data> Iterator call(void(Layer::*func)(Data&), Data &status, const Iterator &begin, const Iterator &end){
+        bool okay_on_start = status.template bounded<Bound>();
+
         for(Iterator it = begin; it != end; ++it){
             ((**it).*func)(status);
-            if(!status.template bounded<Bound>()){
+            if(okay_on_start && !status.template bounded<Bound>()){
                 return it;
             }
         }
@@ -140,12 +117,10 @@ class LayerStack : public Layer, public VectorHelper<Layer>{
         if(it != layers.end()){
             LayerStatus omit;
             call(func_fail, omit, vector_type::reverse_iterator(it), layers.rend());
-            boost::mutex::scoped_lock lock(end_mutex_);
-            run_end_ = layers.begin();
         }
-        else{
+        {
             boost::mutex::scoped_lock lock(end_mutex_);
-            run_end_ = layers.end();
+            run_end_ = it;
         }
     }
 public:
@@ -162,6 +137,8 @@ public:
         if(it != end){
             LayerStatus omit;
             call(&Layer::halt, omit, layers.rbegin(), vector_type::reverse_iterator(it));
+            omit.error();
+            call(&Layer::read, omit, it+1, end);
         }
     }
     virtual void pending(LayerStatus &status){
@@ -180,10 +157,13 @@ public:
             boost::mutex::scoped_lock lock(end_mutex_);
             begin = vector_type::reverse_iterator(run_end_);
         }
-        vector_type::reverse_iterator it = call(&Layer::write, status, begin, layers.rend());
+        
+        vector_type::reverse_iterator it = call<LayerStatus::Warn>(&Layer::write, status, begin, layers.rend());
         if(it != layers.rend()){
             LayerStatus omit;
             call(&Layer::halt, omit, begin, vector_type::reverse_iterator(it));
+            omit.error();
+            call(&Layer::write, omit, it+1, layers.rend());
         }
     }
     virtual void diag(LayerReport &report){
@@ -226,6 +206,8 @@ public:
         if(it != this->layers.end()){
             LayerStatus omit;
             this->template call(&Layer::halt, omit, this->layers.begin(), this->layers.end());
+            omit.error();
+            this->template call(&Layer::read, omit, it+1, this->layers.end());
         }
     }
     virtual void write(LayerStatus &status){
@@ -233,6 +215,8 @@ public:
         if(it != this->layers.end()){
             LayerStatus omit;
             this->template call(&Layer::halt, omit, this->layers.begin(), this->layers.end());
+            omit.error();
+            this->template call(&Layer::write, omit, it+1, this->layers.end());
         }
     }
     virtual void diag(LayerReport &report){
@@ -260,6 +244,24 @@ public:
     }
     LayerGroup(const std::string &n) : Layer(n) {}
 };
+
+template<typename T> class LayerGroupNoDiag : public LayerGroup<T>{
+public:
+    LayerGroupNoDiag(const std::string &n) : LayerGroup<T>(n) {}
+    virtual void diag(LayerReport &report){
+        // no report
+    }
+};
+
+template<typename T> class DiagGroup : public VectorHelper<T>{
+    typedef VectorHelper<T> V;
+public:
+    virtual void diag(LayerReport &report){
+        this->template call(&Layer::diag, report, this->layers.begin(), this->layers.end());
+    }
+};
+
+
 
 } // namespace canopen
 

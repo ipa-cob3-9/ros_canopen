@@ -36,6 +36,17 @@ void ObjectStorage::Data::init(){
             write_delegate(*entry, buffer);
     }
 }
+void ObjectStorage::Data::force_write(){
+    boost::mutex::scoped_lock lock(mutex);
+    
+    if(entry->writable){
+        if(!valid && entry->readable){
+            read_delegate(*entry, buffer);
+            valid = true;
+        }
+        if(valid) write_delegate(*entry, buffer);
+    }
+}
 
 void ObjectStorage::Data::reset(){
     boost::mutex::scoped_lock lock(mutex);
@@ -234,7 +245,7 @@ void parse_objects(boost::shared_ptr<ObjectDict> dict, boost::property_tree::ptr
         parse_object(dict, pt, name);
     }
 }
-boost::shared_ptr<ObjectDict> ObjectDict::fromFile(const std::string &path){
+boost::shared_ptr<ObjectDict> ObjectDict::fromFile(const std::string &path, const ObjectDict::Overlay &overlay){
     DeviceInfo info;
     boost::property_tree::ptree pt;
     boost::shared_ptr<ObjectDict> dict;
@@ -281,7 +292,11 @@ boost::shared_ptr<ObjectDict> ObjectDict::fromFile(const std::string &path){
     }
 
     dict = boost::make_shared<ObjectDict>(info);
-    
+
+    for(Overlay::const_iterator it= overlay.begin(); it != overlay.end(); ++it){
+        pt.get_child(it->first).put("ParameterValue", it->second);
+    }
+
     parse_objects(dict, pt, "MandatoryObjects");
     parse_objects(dict, pt, "OptionalObjects");
     parse_objects(dict, pt, "ManufacturerObjects");
@@ -305,9 +320,15 @@ size_t ObjectStorage::map(const boost::shared_ptr<const ObjectDict::Entry> &e, c
         
         std::pair<boost::unordered_map<ObjectDict::Key, boost::shared_ptr<Data> >::iterator, bool>  ok = storage_.insert(std::make_pair(key, data));
         it = ok.first;
+        it->second->reset();
+
     }
-    
     it->second->set_delegates(read_delegate ?read_delegate: read_delegate_, write_delegate ? write_delegate : write_delegate_);
+    if(write_delegate) it->second->force_write(); // update buffer
+    if(read_delegate){ // special case, reset write delegate
+        it->second->set_delegates(read_delegate, write_delegate_);
+    }
+
     return it->second->size();
 }
 

@@ -127,7 +127,7 @@ void PDOMapper::PDO::parse_and_set_mapping(const boost::shared_ptr<ObjectStorage
                 ObjectStorage::ReadDelegate rd;
                 ObjectStorage::WriteDelegate wd;
                 if(read) rd = ObjectStorage::ReadDelegate(b.get(), &Buffer::read);
-                if(write) wd = ObjectStorage::WriteDelegate(b.get(), &Buffer::write);
+                if(read || write) wd = ObjectStorage::WriteDelegate(b.get(), &Buffer::write); // set writer for buffer setup or as write delegate
                 size_t l = storage->map(param.index, param.sub_index, rd, wd);
                 assert(l  == param.length/8);
             }
@@ -176,7 +176,7 @@ void PDOMapper::init(const boost::shared_ptr<ObjectStorage> storage){
             rpdos_.insert(rpdo);
         }
     }
-    LOG("RPDOs: " << rpdos_.size());
+    // LOG("RPDOs: " << rpdos_.size());
     
     tpdos_.clear();
     for(uint8_t i=0; i < dict.device_info.nr_of_rx_pdo;++i){ // RPDOs of device
@@ -185,7 +185,7 @@ void PDOMapper::init(const boost::shared_ptr<ObjectStorage> storage){
             tpdos_.insert(tpdo);
         }
     }
-    LOG("TPDOs: " << tpdos_.size());
+    // LOG("TPDOs: " << tpdos_.size());
 }
 
 
